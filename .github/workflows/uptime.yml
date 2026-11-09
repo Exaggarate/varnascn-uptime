@@ -1,0 +1,85 @@
+name: uptime-check
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: uptime-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe OCR API + frontend
+        id: probe
+        run: |
+          api="up"; site="up"
+          if ! curl -fsS --max-time 20 https://varnascn.varnaakshara.com/health | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+            api="DOWN"
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://scan.varnaakshara.com/?_probe=$(date +%s)" || true)
+          case "$code" in 200) ;; *) site="${code:-000}" ;; esac
+          echo "api=$api"  >> "$GITHUB_OUTPUT"
+          echo "site=$site" >> "$GITHUB_OUTPUT"
+          [ "$api" = "up" ] && [ "$site" = "up" ]
+
+      - name: Close resolved incident
+        if: success()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            async (github, context) => {
+              const owner = context.repo.owner, repo = context.repo.repo;
+              const q = `repo:${owner}/${repo} is:issue is:open "VarnaScan DOWN" in:title`;
+              const res = await github.search.issuesAndPullRequests({ q, per_page: 5 });
+              for (const it of res.data.items) {
+                await github.issues.createComment({ owner, repo, issue_number: it.number, body: `✅ Recovered at ${new Date().toISOString()} — closing automatically.` });
+                await github.issues.update({ owner, repo, issue_number: it.number, state: 'closed' });
+              }
+            }
+
+      - name: Open or update incident
+        if: failure() && steps.probe.outcome == 'failure'
+        uses: actions/github-script@v7
+        env:
+          API: ${{ steps.probe.outputs.api }}
+          SITE: ${{ steps.probe.outputs.site }}
+        with:
+          script: |
+            async (github, context) => {
+              const stamp = new Date().toISOString();
+              const api = process.env.API || 'DOWN';
+              const site = process.env.SITE || '?';
+              const owner = context.repo.owner, repo = context.repo.repo;
+              const q = `repo:${owner}/${repo} is:issue is:open "VarnaScan DOWN" in:title`;
+              const res = await github.search.issuesAndPullRequests({ q, per_page: 5 });
+              const body = `🚨 VarnaScan uptime check failed at ${stamp}\n\n- OCR API (varnascn.varnaakshara.com/health): **${api}**\n- Frontend (scan.varnaakshara.com): **${site}**\n\nIf the API stays DOWN, restore per RESTORE.md in Exaggarate/varnascn-backend.`;
+              if (res.data.items.length) {
+                await github.issues.createComment({ owner, repo, issue_number: res.data.items[0].number, body: `Still failing at ${stamp} — API: ${api}, Frontend: ${site}` });
+              } else {
+                await github.issues.create({ owner, repo, title: `🚨 VarnaScan DOWN — ${stamp}`, body, labels: ['down'] });
+              }
+            }
+
+      - name: Daily keepalive commit
+        if: always()
+        run: |
+          today=$(date -u +%F)
+          if [ "$(cat .keepalive 2>/dev/null || echo none)" != "$today" ]; then
+            git config user.name "uptime-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            printf '%s\n' "$today" > .keepalive
+            git add .keepalive
+            git commit -m "keepalive $today (prevents 60-day scheduled workflow auto-disable)"
+            git push
+          fi
